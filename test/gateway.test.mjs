@@ -713,6 +713,15 @@ function waitFor(pred, timeout) { return new Promise((res) => { const t0 = Date.
   assert.equal(await waitFor(() => got.some(frame => frame.kind === 'projection-baseline' && frame.projections.s1?.values.goal === null), 2000), true)
   assert.equal(await waitFor(() => got.some(frame => frame.kind === 'goal-updated' && frame.goal === null && frame.asOfSeq === 94), 2000), true)
   interactionResults.push(['control reconnect restores projection baseline', true])
+
+  // harness 0.1.6-alpha.2 的 control baseline 只带 jobs/projections，不再有 queues：
+  // 缺失时不能抛错中断整条 control 流（否则 projections 也永远挂不上）。
+  controlFrames.push({ type: 'baseline', value: { jobs: {}, projections: {
+    s1: { asOfSeq: 95, values: { todos: [], goal: null } },
+  } } })
+  const baselineWithoutQueues = await waitFor(() => got.some(frame => frame.kind === 'projection-baseline' && frame.projections.s1?.asOfSeq === 95), 2000)
+  assert.equal(baselineWithoutQueues, true)
+  interactionResults.push(['control baseline without queues still attaches', baselineWithoutQueues])
   workspaceFrames.push({ type: 'archived', archivedSessionIds: ['s1'] })
   const archivesUpdated = await waitFor(() => got.some((m) => m.kind === 'session-archives' && m.archivedSessionIds.includes('s1')), 2000)
   interactionResults.push(['live session archive state', archivesUpdated])
