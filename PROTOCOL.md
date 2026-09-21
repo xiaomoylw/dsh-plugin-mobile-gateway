@@ -774,6 +774,81 @@ iOS 用 `Data(base64Encoded:)` 解码并按 `attachment.mediaType` 渲染，建�
 - 默认每块为 512 KiB、同时最多 4 个下载、单个文件最多 512 MiB。部署方可用 `fileDownloadChunkBytes`、`fileDownloadMaxTransfers`、`fileDownloadMaxBytes`、`fileDownloadIdleMs` 调整；`fileDownloadsEnabled: false` 会关闭该能力，且 `hello.capabilities` 不再包含 `file-downloads`。
 - 绝对路径、空路径（`file-download-open`）、`..` 路径段、NUL 字符、工作目录外的符号链接、目录和其他非普通文件都会被拒绝。`file-list` 不返回符号链接，避免客户端误认为其可下载。
 
+### 文件上传（手机 → 会话工作区）
+
+文件上传与文件下载对称：客户端把任意字节流写进该 `sessionId` 的 `cwd`。所有 `path` 同样是工作区内的相对路径（`/` 分隔）。服务端先把数据写入目标同目录的临时文件 `<目标文件名>.dsh-upload-<transferId>.part`，只有收满声明字节数（且客户端给出的 SHA-256 校验一致）后才 `fsync` 并原子 `rename` 到目标路径。
+
+`hello.capabilities` 含 `file-uploads` 时可用；`fileUploadsEnabled: false` 时三个帧都返回 `file-upload-disabled`，且该能力不出现在 `capabilities` 里。
+
+| type | 参数 | 说明 |
+|---|---|---|
+| `file-upload-open` | `requestId`, `sessionId`, `path`, `size`, `sha256?`, `overwrite?`, `createParents?` | 开启一次上传；`size` 是客户端声明的整文件字节数（非负整数）；`sha256` 是可选的整文件 64 位十六进制摘要；`overwrite: true` 允许覆盖已存在的目标；`createParents: true` 允许按需创建缺失的父目录 |
+| `file-upload-write` | `transferId`, `offset`, `data`, `eof?`, `sha256?` | 追加一块数据；`data` 是标准 Base64（长度必须是 4 的倍数）；`offset` 必须等于服务端下次期望的偏移；`eof: true` 的最后一帧表示整文件结束，可再带一次整文件 `sha256` |
+| `file-upload-cancel` | `transferId` | 取消上传并删除临时文件 |
+
+```json
+{ "type": "file-upload-open", "requestId": "upload-1", "sessionId": "session-abc",
+  "path": "builds/app-release.apk", "size": 2345678, "sha256": "<64 位十六进制摘要>",
+  "overwrite": true, "createParents": true }
+→ { "kind": "file-upload-opened", "requestId": "upload-1", "transferId": "...",
+    "sessionId": "session-abc", "path": "builds/app-release.apk", "size": 2345678 }
+
+{ "type": "file-upload-write", "transferId": "...", "offset": 0, "data": "<标准 Base64>" }
+→ { "kind": "file-upload-ack", "transferId": "...", "offset": 524288 }
+
+{ "type": "file-upload-write", "transferId": "...", "offset": 2097152, "data": "<标准 Base64>",
+  "eof": true, "sha256": "<64 位十六进制摘要>" }
+→ { "kind": "file-upload-committed", "transferId": "...", "path": "builds/app-release.apk",
+    "size": 2345678, "sha256": "<服务端实收字节的摘要>" }
+
+{ "type": "file-upload-cancel", "transferId": "..." }
+→ { "kind": "file-upload-cancelled", "transferId": "..." }
+```
+
+**ack / commit 语义**
+
+- `file-upload-ack.offset` 是服务端**下次期望**的偏移（等于已收字节数）。客户端必须按 `offset += 本帧 Base64 解码后的字节数` 递增；跳跃、回退或重复的偏移都返回 `file-transfer-offset`。
+- `file-upload-ack` 只表示“已收下并写入临时文件”，不代表已落盘可见；只有 `file-upload-committed` 表示目标文件已经原子替换完成，其 `sha256` 始终是服务端对实际接收字节重算的摘要。
+- 同一 `transferId` 的写帧必须串行：上一帧响应返回前再发一帧会被拒绝（`file-transfer-busy`）。
+- 每个 `transferId` 仅归属创建它的 WebSocket 连接；连接断开、`file-upload-cancel`、上传空闲超时（与下载共用 `fileDownloadIdleMs`，默认 2 分钟）或插件卸载都会删除临时文件并使该 `transferId` 失效。
+
+**路径沙箱与大小限制**
+
+- `path` 必须是相对路径且落在会话 `cwd` 内：`..` 路径段、NUL、绝对路径、工作目录外的符号链接一律拒绝。目标文件可以尚不存在，服务端用“最深的已存在祖先目录”的 realpath 判定归属，因此经符号链接目录逃逸同样返回 `file-not-allowed`；已存在的目标符号链接会先解析再重新判定归属。
+- 父目录不存在时必须显式传 `createParents: true`，否则返回 `file-not-found`；目录链按需创建（`fileUploadAllowCreateDirectories: false` 时改为 `file-not-allowed`）。
+- 目标已存在且未传 `overwrite: true` 时返回 `file-exists`（`open` 与 `commit` 两处都会检查）；目录等非普通文件不可覆盖（`file-not-regular`）。
+- 默认单文件上限 256 MiB、单帧上限 2 MiB、同时最多 4 个上传，分别由 `fileUploadMaxBytes` / `fileUploadChunkMaxBytes` / `fileUploadMaxTransfers` 调整。`fileUploadAllowOverwrite: false` 时即使传 `overwrite: true` 也返回 `file-not-allowed`。
+
+**错误码**
+
+| code | 触发条件 |
+|---|---|
+| `file-upload-disabled` | `fileUploadsEnabled: false` |
+| `bad-request` | 缺 `requestId`/`transferId`/`sessionId`、`size` 非法、`data` 不是标准 Base64、`sha256` 不是 64 位十六进制、路径为绝对路径或含 `..` |
+| `session-not-found` | `sessionId` 不存在 |
+| `file-workspace-unavailable` | 会话没有可用的 `cwd` |
+| `file-not-allowed` | 路径越界、符号链接逃逸，或配置禁止覆盖/创建目录 |
+| `file-not-found` | 父目录不存在且未传 `createParents: true` |
+| `file-not-regular` | 目标是目录等非普通文件 |
+| `file-exists` | 目标已存在且未传 `overwrite: true` |
+| `file-too-large` | 声明 `size` 超过 `fileUploadMaxBytes`、单帧超过 `fileUploadChunkMaxBytes`，或数据超过声明 `size` |
+| `file-transfer-limit` | 活跃上传达到 `fileUploadMaxTransfers` |
+| `file-transfer-not-found` | `transferId` 不存在、已结束或属于其他连接 |
+| `file-transfer-offset` | `offset` 与服务端已收字节数不一致 |
+| `file-transfer-busy` | 同一 `transferId` 上还有未完成的写帧 |
+| `file-transfer-size` | `eof` 时未收满声明 `size`，或非 `eof` 帧超出声明 `size`；该 transfer 随即被丢弃 |
+| `file-integrity` | 客户端给出的 `sha256` 与实际接收字节不一致；临时文件被删除、目标文件保持原样 |
+| `file-unwritable` | 临时文件无法创建、目标无法替换等文件系统错误 |
+| `file-download-disabled` | 下载与上传都被关闭时，`file-list` 也返回该码 |
+
+**原子落盘、SHA-256 校验与中断清理**
+
+1. `file-upload-open` 在目标同目录创建 `<目标文件名>.dsh-upload-<transferId>.part`（`O_CREAT|O_EXCL|O_NOFOLLOW`，权限 `0600`），保证重命名不跨文件系统。
+2. 每个 `file-upload-write` 以位置写入追加到临时文件，服务端同时维护整文件 SHA-256。
+3. `eof: true` 的帧先校验已收字节数等于 `size`，再校验 `sha256`：帧内 `sha256` 优先，其次用 `open` 时声明的 `sha256`；两者都未提供则跳过校验，但 `committed.sha256` 仍返回服务端实收摘要。
+4. 校验通过后服务端对临时文件 `fsync`、关闭句柄，再 `rename` 覆盖目标路径；同一目录内的 `rename` 是原子的，所以 App 或服务端在任何时刻断电，目标文件要么是旧内容、要么是完整新内容，不会出现半个文件。
+5. 任何失败路径（校验不一致、大小不符、取消、连接断开、空闲超时、插件卸载、文件系统错误）都会删除临时文件：中断的上传不留下 `.part` 残留，也不会创建或破坏目标文件。App 侧沿用既有约定：先写自己的临时文件，收到 `file-upload-committed` 后再替换本地文件。
+
 ### `session-stats` 详细（输入框统计条）
 ```json
 { "type": "session-stats", "sessionId": "session-abc" }
@@ -1094,6 +1169,7 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 - `question-answer` / `question-cancel` 会直接恢复或终止等待中的 Agent 工具调用；只允许经过鉴权的可信设备提交，并按 `rpcId` 防止重复操作
 - `approval-response` 会直接允许或拒绝等待中的高风险工具操作；只允许经过鉴权的可信设备提交，并按 `rpcId` 和 `approvalId` 防止串用或重复操作
 - 文件下载只允许读取该会话 `cwd` 内的普通文件；移动端必须在写入完成后校验最终块给出的 SHA-256，且不得把 `transferId` 视为可跨连接复用的凭证
+- 文件上传只允许写入该会话 `cwd`（相对路径、无 `..`、无越界符号链接），先落同目录 `.part` 临时文件、校验声明大小与 SHA-256 后再原子替换目标；确认收到 `file-upload-committed` 前不要覆盖本地副本，失败与取消会删除临时文件
 
 ---
 
@@ -1101,6 +1177,7 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 
 | 版本 | 新增 |
 |---|---|
+| v0.8.0 | 会话工作区文件上传：`file-upload-open` / `file-upload-write` / `file-upload-cancel` 三帧与 `file-upload-opened` / `file-upload-ack` / `file-upload-committed` / `file-upload-cancelled` 四种 kind；分块 ack、声明大小与 SHA-256 校验、同目录临时文件 + fsync + 原子 rename 落盘、失败与中断清理；新增 `fileUploadsEnabled` / `fileUploadMaxBytes` / `fileUploadChunkMaxBytes` / `fileUploadMaxTransfers` / `fileUploadAllowOverwrite` / `fileUploadAllowCreateDirectories` 配置与 `file-uploads` 能力 |
 | v0.7.2 | 独立对话/控制连接；空 Session 创建；停止生成与稍后继续；排队消息同步及编辑/删除/Steer；App 归档/重命名 Session；WebUI 归档集合和名称变化实时同步到 App |
 | v0.1.5 | workspace-create / directories / host |
 | v0.1.6 | 修复消息分发器遗漏（host/directories/workspace-create 未路由） |

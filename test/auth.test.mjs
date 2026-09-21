@@ -252,6 +252,7 @@ function expectRejected(url, options = {}) {
     'session-archive',
     'session-rename',
     'file-downloads',
+    'file-uploads',
   ])
   const connectedStatus = await (await fetch(`${base}/mgw/status`)).json()
   assert.equal(connectedStatus.gatewayEnabled, true)
