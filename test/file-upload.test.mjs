@@ -10,6 +10,7 @@ const path = require('node:path')
 const { once } = require('node:events')
 const WebSocket = require('ws')
 const plugin = (await import('../lib/index.mjs')).default
+const { sweepTempUploadDirectory } = await import('../lib/index.mjs')
 
 const SESSION_ID = 'upload-session'
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-upload-'))
@@ -83,6 +84,9 @@ async function startGateway(config) {
     gatewayWaitTimeoutMs: 60_000,
     deviceFile: path.join(temp, 'devices.json'),
     publicUrlFile: path.join(temp, 'missing-public-url'),
+    // Each stub gateway gets its own temp upload directory so a sweep never
+    // touches the deployment default.
+    fileUploadTempDirectory: fs.mkdtempSync(path.join(temp, 'uploads-')),
     ...config,
   })
   server.listen(0, '127.0.0.1')
@@ -372,6 +376,186 @@ async function chunkedUpload(client, fileName, bytes, chunkBytes) {
     await once(disabledClient.ws, 'close')
     await disabled.close()
     console.log('PASS 9: fileUploadsEnabled:false rejects every upload frame')
+  }
+
+  // 10. root:'temp' writes into <fileUploadTempDirectory>/<UTC date>/<name>, never
+  // into the session workspace, and both replies carry the absolute path.
+  {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-temp-upload-'))
+    const tempGateway = await startGateway({ fileUploadTempDirectory: tempDir })
+    const tempClient = await connect(tempGateway.url)
+    const day = new Date().toISOString().slice(0, 10)
+    const bytes = Buffer.from('temp upload payload\n'.repeat(64))
+    const requestFrame = {
+      type: 'file-upload-open', requestId: 'temp-1', sessionId: SESSION_ID,
+      path: 'drop.log', size: bytes.length, sha256: sha256Of(bytes), root: 'temp',
+    }
+    const opened = await openUpload(tempClient, {
+      requestId: 'temp-1', path: 'drop.log', size: bytes.length, sha256: sha256Of(bytes), root: 'temp',
+    })
+    assert.equal(opened.kind, 'file-upload-opened')
+    assert.equal(opened.root, 'temp')
+    assert.equal(opened.sessionId, SESSION_ID)
+    assert.equal(opened.path, `${day}/drop.log`)
+    assert.equal(opened.absolutePath, path.join(tempDir, day, 'drop.log'))
+    assert.equal(path.isAbsolute(opened.absolutePath), true)
+    assert.equal(opened.size, bytes.length)
+    assert.equal(fs.statSync(path.dirname(opened.absolutePath)).isDirectory(), true, 'the UTC date bucket is created at open')
+
+    const committed = await writeUpload(tempClient, opened.transferId, 0, bytes, { eof: true, sha256: sha256Of(bytes) })
+    assert.equal(committed.kind, 'file-upload-committed')
+    assert.equal(committed.root, 'temp')
+    assert.equal(committed.path, `${day}/drop.log`)
+    assert.equal(committed.absolutePath, opened.absolutePath)
+    assert.equal(committed.size, bytes.length)
+    assert.equal(committed.sha256, sha256Of(bytes))
+    const stored = fs.readFileSync(committed.absolutePath)
+    assert.equal(stored.equals(bytes), true)
+    assert.equal(sha256Of(stored), sha256Of(bytes))
+    assert.deepEqual(stagingFiles(tempDir), [])
+    assert.equal(fs.existsSync(path.join(workspace, 'drop.log')), false, 'temp uploads must not enter the project directory')
+    console.log(`temp upload frames: ${JSON.stringify({
+      request: requestFrame,
+      opened,
+      committed,
+    })}`)
+    console.log('PASS 10: root:"temp" upload lands in <tempDir>/<date>/<name> with a matching absolutePath')
+
+    // 11. root:'temp' accepts a bare file name only.
+    for (const badPath of ['../escape.log', 'nested/escape.log', `nested${path.sep}escape.log`, '/etc/passwd', '..\\escape.log', '  ..  ', '', '   ']) {
+      const reply = await openUpload(tempClient, { requestId: 'temp-bad', path: badPath, size: 4, root: 'temp' })
+      assert.equal(reply.kind, 'error', `path ${JSON.stringify(badPath)} must be rejected`)
+      assert.equal(reply.code, 'bad-request')
+      assert.equal(reply.requestType, 'file-upload-open')
+      assert.equal(reply.sessionId, SESSION_ID)
+    }
+    const badRoot = await openUpload(tempClient, { requestId: 'temp-root', path: 'ok.log', size: 4, root: 'elsewhere' })
+    assert.equal(badRoot.kind, 'error')
+    assert.equal(badRoot.code, 'bad-request')
+    assert.deepEqual(stagingFiles(tempDir), [])
+    console.log('PASS 11: root:"temp" rejects traversal, separators, absolute paths and unknown roots')
+
+    // 12. Regression: an omitted root still targets the session workspace.
+    {
+      const body = Buffer.from('abc')
+      const openedDefault = await openUpload(tempClient, { requestId: 'default-root-1', path: 'default-root.txt', size: body.length })
+      assert.equal(openedDefault.kind, 'file-upload-opened')
+      assert.equal(openedDefault.root, 'workspace')
+      assert.equal(openedDefault.path, 'default-root.txt')
+      assert.equal(openedDefault.absolutePath, path.join(workspace, 'default-root.txt'))
+      const committedDefault = await writeUpload(tempClient, openedDefault.transferId, 0, body, { eof: true })
+      assert.equal(committedDefault.kind, 'file-upload-committed')
+      assert.equal(committedDefault.root, 'workspace')
+      assert.equal(committedDefault.absolutePath, path.join(workspace, 'default-root.txt'))
+      assert.equal(fs.readFileSync(path.join(workspace, 'default-root.txt'), 'utf8'), 'abc')
+      assert.equal(fs.existsSync(path.join(tempDir, day, 'default-root.txt')), false)
+      const explicit = await openUpload(tempClient, { requestId: 'explicit-root-1', path: 'explicit-root.txt', size: body.length, root: 'workspace' })
+      assert.equal(explicit.root, 'workspace')
+      assert.equal(explicit.absolutePath, path.join(workspace, 'explicit-root.txt'))
+      assert.equal((await cancelUpload(tempClient, explicit.transferId)).kind, 'file-upload-cancelled')
+      console.log('PASS 12: omitted root keeps writing into the session workspace')
+    }
+
+    // 13. Temp sandbox: a symlinked leaf that leaves the temp directory is refused.
+    {
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-temp-outside-'))
+      fs.writeFileSync(path.join(outsideDir, 'target.log'), 'outside the temp directory\n')
+      fs.symlinkSync(path.join(outsideDir, 'target.log'), path.join(tempDir, day, 'linked.log'))
+      const reply = await openUpload(tempClient, { requestId: 'temp-link-1', path: 'linked.log', size: 4, overwrite: true, root: 'temp' })
+      assert.equal(reply.kind, 'error')
+      assert.equal(reply.code, 'file-not-allowed')
+      assert.equal(fs.readFileSync(path.join(outsideDir, 'target.log'), 'utf8'), 'outside the temp directory\n')
+      assert.deepEqual(stagingFiles(outsideDir), [])
+      tempClient.ws.close()
+      await once(tempClient.ws, 'close')
+      await tempGateway.close()
+      fs.rmSync(tempDir, { recursive: true, force: true })
+      fs.rmSync(outsideDir, { recursive: true, force: true })
+      console.log('PASS 13: a symlink escaping the temp directory is file-not-allowed')
+    }
+  }
+
+  // 14. Retention sweep: files and staging leftovers past their age are removed,
+  // fresh files and non-upload content are kept.
+  {
+    const day = new Date().toISOString().slice(0, 10)
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-temp-sweep-'))
+    const bucket = path.join(root, day)
+    fs.mkdirSync(bucket, { recursive: true })
+    const oldFile = path.join(bucket, 'old.log')
+    const freshFile = path.join(bucket, 'fresh.log')
+    const stalePart = path.join(bucket, 'interrupted.log.dsh-upload-abc.part')
+    const emptyOld = path.join(root, '2026-01-01')
+    fs.writeFileSync(oldFile, 'old\n')
+    fs.writeFileSync(freshFile, 'fresh\n')
+    fs.writeFileSync(stalePart, 'partial')
+    fs.mkdirSync(emptyOld)
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000)
+    fs.utimesSync(oldFile, eightDaysAgo, eightDaysAgo)
+    fs.utimesSync(stalePart, eightDaysAgo, eightDaysAgo)
+    fs.utimesSync(emptyOld, eightDaysAgo, eightDaysAgo)
+
+    const swept = await sweepTempUploadDirectory(root, 7)
+    assert.equal(swept.skipped, false)
+    assert.equal(swept.removed, 2, `expected the 8-day-old file and stale .part to go, removed=${swept.removed}`)
+    assert.equal(swept.kept, 1, `expected only the fresh file to stay, kept=${swept.kept}`)
+    assert.equal(fs.existsSync(oldFile), false)
+    assert.equal(fs.existsSync(stalePart), false)
+    assert.equal(fs.existsSync(freshFile), true)
+    assert.equal(fs.existsSync(emptyOld), false, 'an aged empty directory is pruned')
+    assert.deepEqual(stagingFiles(root), [])
+
+    // A directory emptied by the sweep itself disappears with its last file.
+    // 注意：被"外部"清空的日期目录不会立刻删——正在进行的上传可能刚建好目录还没落文件，
+    // 立刻 rmdir 会抢掉它的目录。所以空目录要等自身 mtime 也超过保留期才删。
+    fs.rmSync(freshFile)
+    const stillThere = await sweepTempUploadDirectory(root, 7)
+    assert.equal(stillThere.removed, 0)
+    assert.equal(fs.existsSync(bucket), true, 'a freshly emptied bucket stays for in-flight uploads')
+    fs.utimesSync(bucket, eightDaysAgo, eightDaysAgo)
+    const cascaded = await sweepTempUploadDirectory(root, 7)
+    assert.equal(cascaded.removed, 0)
+    assert.equal(fs.existsSync(bucket), false, 'an aged, emptied date bucket is pruned')
+    assert.equal(fs.existsSync(root), true, 'the temp root itself is never removed')
+
+    // retention 0 disables cleanup entirely: nothing is deleted, ever.
+    fs.mkdirSync(bucket, { recursive: true })
+    const keptOld = path.join(bucket, 'kept-old.log')
+    fs.writeFileSync(keptOld, 'kept\n')
+    fs.utimesSync(keptOld, eightDaysAgo, eightDaysAgo)
+    const disabled = await sweepTempUploadDirectory(root, 0)
+    assert.equal(disabled.skipped, true)
+    assert.equal(disabled.removed, 0)
+    assert.equal(disabled.kept, 0)
+    assert.equal(fs.existsSync(keptOld), true)
+    fs.rmSync(root, { recursive: true, force: true })
+    console.log('PASS 14: the sweep removes 8-day-old files and stale .part files, and keeps everything when retention is 0')
+  }
+
+  // 15. End to end: the plugin sweeps at startup, and fileUploadTempRetentionDays:0
+  // keeps the same directory untouched.
+  {
+    const sweepDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-temp-startup-'))
+    const bucket = path.join(sweepDir, new Date().toISOString().slice(0, 10))
+    fs.mkdirSync(bucket, { recursive: true })
+    const stale = path.join(bucket, 'stale.log')
+    const fresh = path.join(bucket, 'fresh.log')
+    fs.writeFileSync(stale, 'stale\n')
+    fs.writeFileSync(fresh, 'fresh\n')
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000)
+    fs.utimesSync(stale, eightDaysAgo, eightDaysAgo)
+
+    const keepGateway = await startGateway({ fileUploadTempDirectory: sweepDir, fileUploadTempRetentionDays: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(fs.existsSync(stale), true, 'retention 0 must not delete anything')
+    keepGateway.close()
+
+    const sweepGateway = await startGateway({ fileUploadTempDirectory: sweepDir })
+    assert.equal(await waitFor(() => !fs.existsSync(stale)), true, 'the startup sweep must remove the stale temp upload')
+    assert.equal(fs.existsSync(fresh), true, 'the fresh temp upload stays')
+    sweepGateway.close()
+    fs.rmSync(sweepDir, { recursive: true, force: true })
+    console.log('PASS 15: the startup sweep honours fileUploadTempRetentionDays')
   }
 
   client.ws.close()

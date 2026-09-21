@@ -782,7 +782,7 @@ iOS 用 `Data(base64Encoded:)` 解码并按 `attachment.mediaType` 渲染，建�
 
 | type | 参数 | 说明 |
 |---|---|---|
-| `file-upload-open` | `requestId`, `sessionId`, `path`, `size`, `sha256?`, `overwrite?`, `createParents?` | 开启一次上传；`size` 是客户端声明的整文件字节数（非负整数）；`sha256` 是可选的整文件 64 位十六进制摘要；`overwrite: true` 允许覆盖已存在的目标；`createParents: true` 允许按需创建缺失的父目录 |
+| `file-upload-open` | `requestId`, `sessionId`, `path`, `size`, `sha256?`, `overwrite?`, `createParents?`, `root?` | 开启一次上传；`size` 是客户端声明的整文件字节数（非负整数）；`sha256` 是可选的整文件 64 位十六进制摘要；`overwrite: true` 允许覆盖已存在的目标；`createParents: true` 允许按需创建缺失的父目录；`root` 缺省/`"workspace"` = 写进会话工作区（`path` 为工作区相对路径），`"temp"` = 写进服务端临时目录（`path` 只能是**纯文件名**，服务端拼成 `<fileUploadTempDirectory>/<UTC 日期>/<文件名>`，不接受分隔符与 `..`） |
 | `file-upload-write` | `transferId`, `offset`, `data`, `eof?`, `sha256?` | 追加一块数据；`data` 是标准 Base64（长度必须是 4 的倍数）；`offset` 必须等于服务端下次期望的偏移；`eof: true` 的最后一帧表示整文件结束，可再带一次整文件 `sha256` |
 | `file-upload-cancel` | `transferId` | 取消上传并删除临时文件 |
 
@@ -792,6 +792,12 @@ iOS 用 `Data(base64Encoded:)` 解码并按 `attachment.mediaType` 渲染，建�
   "overwrite": true, "createParents": true }
 → { "kind": "file-upload-opened", "requestId": "upload-1", "transferId": "...",
     "sessionId": "session-abc", "path": "builds/app-release.apk", "size": 2345678 }
+
+{ "type": "file-upload-open", "requestId": "upload-2", "sessionId": "session-abc",
+  "path": "device.log", "size": 459198, "root": "temp" }
+→ { "kind": "file-upload-opened", "requestId": "upload-2", "transferId": "...",
+    "sessionId": "session-abc", "root": "temp", "path": "2026-09-21/device.log",
+    "absolutePath": "/root/dsh-uploads/2026-09-21/device.log", "size": 459198 }
 
 { "type": "file-upload-write", "transferId": "...", "offset": 0, "data": "<标准 Base64>" }
 → { "kind": "file-upload-ack", "transferId": "...", "offset": 524288 }
@@ -1178,6 +1184,8 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 | 版本 | 新增 |
 |---|---|
 | v0.8.0 | 会话工作区文件上传：`file-upload-open` / `file-upload-write` / `file-upload-cancel` 三帧与 `file-upload-opened` / `file-upload-ack` / `file-upload-committed` / `file-upload-cancelled` 四种 kind；分块 ack、声明大小与 SHA-256 校验、同目录临时文件 + fsync + 原子 rename 落盘、失败与中断清理；新增 `fileUploadsEnabled` / `fileUploadMaxBytes` / `fileUploadChunkMaxBytes` / `fileUploadMaxTransfers` / `fileUploadAllowOverwrite` / `fileUploadAllowCreateDirectories` 配置与 `file-uploads` 能力 |
+| v0.8.1–0.8.2 | 修 harness 0.1.6-alpha.2 起 `session/control` 基线不再携带 `queues` 字段的兼容问题：此前每次连接都会抛错并导致整条 control 流每秒重建（projections 永远挂不上）。现在缺失/null 时按空队列处理并记日志（`session queue baseline absent …`），不再中断流；同时修掉首版补丁在 `sessionQueues` 仍为 null 时的崩溃 |
+| v0.9.0 | 上传到临时目录：`file-upload-open` 新增 `root: "workspace" \| "temp"`（缺省 `workspace`，向后兼容）；`"temp"` 时落 `<fileUploadTempDirectory>/<UTC 日期>/<文件名>`（`path` 仅接受纯文件名），`file-upload-opened` / `file-upload-committed` 新增 `absolutePath` 字段；新增 `fileUploadTempDirectory`（默认 `/root/dsh-uploads`）与 `fileUploadTempRetentionDays`（默认 7，0 = 关闭清理）配置，插件启动时与每小时按 mtime 清理过期文件与空目录（含遗留 24 小时以上的 `.part`） |
 | v0.7.2 | 独立对话/控制连接；空 Session 创建；停止生成与稍后继续；排队消息同步及编辑/删除/Steer；App 归档/重命名 Session；WebUI 归档集合和名称变化实时同步到 App |
 | v0.1.5 | workspace-create / directories / host |
 | v0.1.6 | 修复消息分发器遗漏（host/directories/workspace-create 未路由） |
