@@ -1,6 +1,6 @@
 # dsh Mobile Gateway — WebSocket 协议参考
 
-移动端通过经过设备鉴权的 WebSocket 连接与 dsh 通信：订阅 agent 实时输出、发送文字和图片、处理 Human-in-the-loop 提问与操作审批、查询会话/工作区/历史、调整会话配置。本协议由持久化插件 `dsh-plugin-mobile-gateway` 实现。当前源码仅适配 DSH 0.1.5-rc.2 / Session format 3，移动端接入变更见 [rc.2 接入说明](docs/dsh-rc2-mobile-integration.md)。
+移动端通过经过设备鉴权的 WebSocket 连接与 dsh 通信：订阅 agent 实时输出、发送文字和图片、处理 Human-in-the-loop 提问与操作审批、查询会话/工作区/历史、调整会话配置。本协议由持久化插件 `dsh-plugin-mobile-gateway` 实现。当前源码适配 DSH 0.2.0-rc.2 / Session format 4；移动端实时流接入见 [rc.2 接入说明](docs/dsh-rc2-mobile-integration.md)，插件管理见 [RC2 插件管理对接方案](docs/dsh-0.2.0-rc.2-plugin-management-mobile-integration.md)。
 
 - **本机端点**：`ws://127.0.0.1:3080/ws/mobile`（与 dsh web GUI 同端口）
 - **局域网端点**：`ws://<电脑的私有局域网 IP>:3081/ws/mobile`（插件独立监听，只提供经过鉴权的 WebSocket）
@@ -100,13 +100,17 @@ const pairingText = Buffer.from(JSON.stringify(payload), 'utf8').toString('base6
 | `gatewayName` | 同上 | 展示名称，允许改变，不能作为身份或鉴权依据 |
 | `endpoints` | 配对载荷、`GET /mgw/status` | 规范化去重的 URL 字符串数组；不在 `hello` 或 `paired` 返回 |
 
-配对仍保留 `publicUrl`，且它排在本次 `endpoints` 第一项。其后按本机配对请求 `endpoints`、插件配置 `endpoints`、公网配置、已监听 LAN 地址的顺序合并。每个输入列表及合并结果最多 16 项，每项最多 2048 字符。允许 HTTP(S) 输入并转为 WS(S)，拒绝凭证、query、fragment、未指定监听地址及公网明文 WS。
+配对仍保留 `publicUrl`，且它排在本次 `endpoints` 第一项。其后按本机配对请求 `endpoints`、插件配置 `endpoints`、公网配置、已取得的 Cloudflare Tunnel 地址、已监听 LAN 地址的顺序合并。每个输入列表及合并结果最多 16 项，每项最多 2048 字符。允许 HTTP(S) 输入并转为 WS(S)，拒绝凭证、query、fragment、未指定监听地址及公网明文 WS。
 
 `POST /mgw/pair` 可额外传入 `endpoints: string[]`，只用于本次配对，不写入配置。移动端对新地址必须在发送凭证前建立信任；`hello` 的 ID 校验发生在鉴权后，不能替代 TLS 和地址确认。多个网关的 token 独立签发、保存和撤销；App 以网关连接上下文路由原有业务请求。
 
 本机管理接口 `POST /mgw/gateway` 接受 `{"mode":"disabled|temporary|persistent"}` 中的一个具体值，例如 `{"mode":"persistent"}`。兼容旧 `{"enabled":true}`（临时开启）与 false（关闭）；不能同时传 `mode` 和 `enabled`。返回 `gatewayEnabled`、`gatewayMode`、`waitExpiresAt`、`connectedClients`。参数错误返回 400；保存失败返回 500 且不改变当前运行模式。
 
 `GET /mgw/status` 增加身份、地址列表及 `gatewayMode`。模式的持久化不影响配对码有效期和文件传输超时。自动超时关闭若遇到磁盘写入失败，会保持当前进程关闭并记录错误；重启可能仍按旧保存模式运行，需修复存储后再次保存选择。
+
+Windows/macOS PC 可从本机管理接口 `POST /mgw/cloudflare` 一键启用 Quick Tunnel：`{"enabled":true,"mode":"quick"}`，无需账户、域名或 Token；返回的随机公网地址在 `GET /mgw/status` 的 `cloudflare.publicUrl` 中，隧道重启后可能变化，App 需重新扫码确认。固定地址可用命名 Tunnel：`{"enabled":true,"mode":"named","hostname":"gateway.example.com","token":"<Tunnel Token>"}`；后续更新可省略 Token 或传空字符串以保留已保存的 Token，关闭时只需 `{"enabled":false}`。状态字段返回模式、支持状态、公开地址、本机入口端口、连接状态和错误，但绝不返回 Token。启用时网关自动切为常驻模式；配置与 Token 保存在独立的 `0600` 文件中。插件会在需要时下载并校验 Cloudflare 官方 `cloudflared` 二进制。两种模式仅在 `127.0.0.1:3082`（可配置）接受已鉴权的 `/ws/mobile` WebSocket，其他 HTTP 路径返回 404；网关关闭或插件卸载时该入口及受管进程一同停止。
+
+`POST /mgw/cloudflare/restart` 无需请求体，仅在网关与 Tunnel 均已开启时重启隧道；未开启时返回 `409`。当前移动连接会断开，Quick Tunnel 的地址可能变化，客户端需重新扫码确认。此操作不会重启 DSH Web，也不会将 `cloudflared` 自动更新到最新版本。
 
 完整配对示例、旧 App 迁移、地址信任与错误处理见 [App 对接说明](docs/multi-gateway-app-integration.md)。
 
@@ -174,6 +178,8 @@ func connectAuthenticated(publicURL: URL, token: String) -> URLSessionWebSocketT
 `subscribed` 之后，服务端会紧接着发送该 Session 尚未处理的
 `question-requested` / `approval-requested`，并标记 `replay: true`。客户端必须按
 `rpcId` 去重。这保证移动端在审批产生后才打开已有 Session 时仍能显示待处理卡片。
+启用 `split-channels` 时，`subscribe` 仍由 conversation 连接发送，但上述重放帧会
+桥接到 control 连接；交互卡片不得发送到 conversation 连接。
 
 ---
 
@@ -186,9 +192,16 @@ Human-in-the-loop 分为两条独立通道：
 
 二者都是 Host waterfall 的临时请求，不属于持久化的 `session/event`，且都必须以插件为该次请求生成的 `rpcId` 通过专用响应帧回答，不能作为普通 `message` 发送。该内部实现不改变移动端帧格式。
 
+同一请求遵循“任意端先完成、所有端同步收起”的单胜方规则：Mobile 任一设备先完成时，Gateway 会结束 Host 的 WebUI 远端请求并让所有 WebUI 实例收起；任一 WebUI 先完成时，Host 会取消其余 WebUI 实例，Gateway 同时向所有 Mobile 设备广播终态。迟到响应统一视为 `not-pending`。
+
 ### 3.1 提问与回答
 
-Agent 调用 DSH 的 `ask_user_question` 工具时，插件直接接入 Host 的 `user-questions/request` waterfall，并把临时请求投影给移动端。若没有可处理该 Session 的移动连接，插件调用 `next()`，由 WebUI 或后续 Host answerer 处理。
+Agent 调用 DSH 的 `ask_user_question` 工具时，插件接入 Host 的
+`user-questions/request` waterfall，把临时请求投影给移动端，同时继续启动 WebUI
+或后续 Host answerer。任一端先给出有效答案即完成该请求；Gateway 会向所有移动端
+广播 `question-resolved`。Mobile 先完成时，Gateway 同时取消 WebUI 的对应远端请求，
+使其收起半屏弹窗；WebUI 先完成时，移动端收到终态后收起对应卡片。若 Mobile 已断开，
+则由仍在等待的 Host answerer 继续处理。
 
 #### `question-requested` — 服务端推送问题
 
@@ -292,7 +305,12 @@ Agent 调用 DSH 的 `ask_user_question` 工具时，插件直接接入 Host 的
 
 ### 3.2 操作审批
 
-当 DSH 的工具管线要求人工授权时，插件会接入一次 Host `approval/request` waterfall，并向移动端投影为 `approval-requested`。这正是 Web UI 中“等待审批”卡片对应的能力：`reason` 是面向用户的审批说明，`toolName` 标识请求操作的工具，`callId` 可用于与实时工具调用轨迹关联。
+当 DSH 的工具管线要求人工授权时，插件会接入一次 Host `approval/request`
+waterfall，并向移动端投影为 `approval-requested`，同时保留 WebUI answerer；WebUI
+与 Mobile 中任一端先提交的有效决定生效。Gateway 随后向所有移动端广播
+`approval-resolved`；若 Mobile 先完成，还会取消 WebUI 的对应远端请求以收起审批弹窗。
+`reason` 是面向用户的审批说明，`toolName` 标识请求操作的工具，`callId` 可用于与实时
+工具调用轨迹关联。
 
 #### `approval-requested` — 服务端推送待审批操作
 
@@ -305,6 +323,7 @@ Agent 调用 DSH 的 `ask_user_question` 工具时，插件直接接入 Host 的
   "toolName": "bash",
   "callId": "call-42",
   "reason": "escalate sandbox to danger-full-access",
+  "displayReason": { "en": "Allow this command?", "zh-CN": "允许执行此命令？" },
   "replay": true
 }
 ```
@@ -312,7 +331,8 @@ Agent 调用 DSH 的 `ask_user_question` 工具时，插件直接接入 Host 的
 - `rpcId`：本次可回答请求的稳定 RPC ID；提交决定时必须原样返回。
 - `approvalId`：移动网关生成的本次审批关联 ID；同样必须原样返回，并用于将最终状态关联到本地审批卡片。
 - `toolName`：请求审批的工具名。
-- `callId` / `reason`：可选。前者可关联工具调用，后者应直接显示为待审批原因。
+- `callId` / `reason`：可选。前者可关联工具调用，后者是原始审批说明。
+- `displayReason`：rc.2 新增的可选多语言说明；客户端优先按当前语言显示，缺失时回退到 `reason`。该字段也会随待处理请求重放。
 - `replay: true`：表示当前仍未决定的审批在移动端连接或切换 Session 后重放。客户端应按 `rpcId` 去重。
 
 审批请求不含工具完整参数；移动端应将 `reason` 与可见的工具调用轨迹作为展示依据，不应自行推断或构造命令。
@@ -554,7 +574,7 @@ let image = [
 
 ### 排队消息同步与修改
 
-`hello.capabilities` 包含 `queue-control` 时，控制连接会收到 Host 当前待处理消息。连接初始化或 Host 控制流重连后，网关发送完整快照：
+`hello.capabilities` 包含 `queue-control` 时，控制连接会收到 Host 当前待处理消息。DSH 0.1.7-rc.1 从 `session/control` 的 `projections.values.inbox` 提供待处理消息：`next-turn` 映射为 `queued`，`next-step` 按来源映射为 `steering` 或 `context`。连接初始化或 Host 控制流重连后，网关发送完整快照：
 
 ```json
 {
@@ -575,7 +595,7 @@ let image = [
 }
 ```
 
-之后某个 Session 的队列发生变化时，网关发送该 Session 的完整替换值：
+之后某个 Session 的 `inbox` 投影发生变化时，网关发送该 Session 的完整替换值：
 
 ```json
 { "kind": "session-queue", "sessionId": "session-abc", "items": [] }
@@ -682,8 +702,8 @@ WebUI、App 或其他客户端造成的变化通过以下帧主动推送：
 - 返回**原始 SessionEvent**（`{type, seq, time, data}`，方案A），可选裁剪
 - 图片不会内联进历史页。`user/message.data.content[]` 中的图片块为 `{ "type":"image", "attachment": ImageAttachmentRef }`；iOS 使用其中的 `attachmentId` 请求图片数据
 - `maxBytes`：单帧字节预算，默认 **4 MiB**；超预算保留最新部分并给出 `nextBeforeSeq` 续页（客户端 16 MiB 上限的安全余量）
-- `view: "conversation"`：**对话裁剪模式**——隐藏系统消息与 request/header、request/context，移除 Assistant 事件的内嵌 `data.stream`，`tool/result` 嵌套文本截断到 2000 字符
-- 分页：`hasMore` 为真时用 `beforeSeq: nextBeforeSeq, historyFormatVersion: 3` 请求更早一页
+- `view: "conversation"`：**对话裁剪模式**——隐藏系统消息与 request/header、request/context，移除 Assistant 事件的内嵌 `data.stream`，`tool/result` 文本截断到 2000 字符
+- 分页：`hasMore` 为真时用 `beforeSeq: nextBeforeSeq, historyFormatVersion: 4` 请求更早一页
 
 ```json
 → { "kind": "history", "sessionId": "session-abc", "events": [ ...原始事件... ],
@@ -1021,7 +1041,7 @@ WebUI 中的“任务”与“进行中的目标”分别对应 DSH 的 `todos` 
 
 | type | 参数 | 说明 |
 |---|---|---|
-| `permission-options` | `sessionId?` | 可用权限 preset 列表（`namespace`）+ 该会话当前生效值（`sessionPermissions`） |
+| `permission-options` | `sessionId?` | Host `permissionPresets/catalog` 的 `options`、`defaultOptions`、`defaultPreset`，以及该会话当前生效值（`sessionPermissions`） |
 | `permission` | `sessionId`, `name` | 切换**该会话**的权限 preset（走官方 `/permission` 命令，不触发模型） |
 
 ```json
@@ -1039,16 +1059,18 @@ WebUI 中的“任务”与“进行中的目标”分别对应 DSH 的 `todos` 
 | `agent-presets` | — | preset 名册（含 `isDefault` 标记） |
 | `session-agent-preset` | `sessionId`, `requestId?` | 读取当前会话的 `agentPreset` 和 `locked` |
 | `select-agent-preset` | `sessionId`, `agentPreset`, `requestId?` | 在首次对话前修改当前会话模式，保持 session ID |
-| `defaults` | — | 读取默认 agent 预设 + 默认权限 |
+| `defaults` | — | 读取默认 Agent 预设、默认权限及动态可选默认权限（`permissionDefaultOptions`） |
 | `set-default` | `target`(agent-preset\|permission), `value` | 修改默认预设/默认权限（全局） |
 
 ```json
 { "type": "defaults" }
-→ { "kind": "defaults", "agentPresetDefault": "standard", "permissionDefault": "ask" }
+→ { "kind": "defaults", "agentPresetDefault": "standard", "permissionDefault": "ask", "permissionDefaultOptions": [{ "value": "ask", "name": "Ask" }], "modeSelectionEnabled": true }
 
 { "type": "set-default", "target": "agent-preset", "value": "minimal" }
 → { "kind": "set-default", "target": "agent-preset", "value": "minimal", "applied": true }
 ```
+
+DSH 0.1.7-rc.2 的 Agent preset 名册不再包含 `modeSelectionEnabled`。网关在字段缺失时仍允许移动端选择和保存默认模式；旧版 Host 明确返回 `false` 时沿用其禁用语义。这个移动端字段不代表桌面端「代码工作工具」的本地开关状态。
 
 ### 当前会话模式选择
 
@@ -1096,7 +1118,7 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 ## 11. 分支（fork）
 
 ```json
-{ "type": "fork", "sessionId": "session-abc", "atSeq": 42, "historyFormatVersion": 3 }
+{ "type": "fork", "sessionId": "session-abc", "atSeq": 42, "historyFormatVersion": 4 }
 → { "kind": "fork", "sessionId": "session-分支新会话" }
 ```
 - `atSeq`：从该消息所在的**完整一轮**分叉（省略 = 最近完成的 turn）；进行中的 turn 分叉会报 `fork-unavailable`
@@ -1129,6 +1151,7 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 | `session-archives` | Host 的完整 Session 归档集合在连接初始化或 WebUI/App 归档后变化 |
 | `session-title-changed` | 任意客户端写入新的持久化 Session 名称 |
 | `tasks-updated` / `goal-updated` | 当前会话的任务列表或目标 projection 发生变化 |
+| `schedule-changed` | Host 定时任务目录已变化；无载荷，重新请求 `schedule-catalog` 或当前 Session 的 `schedule-list` |
 | `question-requested` / `question-resolved` | Human-in-the-loop 问题请求与最终状态 |
 | `approval-requested` / `approval-resolved` | Human-in-the-loop 操作审批请求与最终状态 |
 | `pong` / `subscribed` / `sent` | 对应请求的回复 |
@@ -1148,6 +1171,12 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 - `tool/result` → `{turn, step, callId, isError, preview(≤400字符)}`
 - `turn/start|end` / `step/start|end` → `{turn, step, reason?}`
 
+### 运行中计时提示
+
+DSH Web 的“深度求索中，用时 22 秒 ···”是客户端文案，不作为独立 Host 事件或网关帧发送。移动端可用 `sessions.items[].running` 判断会话是否运行；订阅中的 `event` 帧在根节点带 `time`，`event.type: turn/start` 标记本轮开始，`turn/end` 标记结束。收到 `turn/start` 后以 `Date.now() - time` 在本地更新秒数，收到 `turn/end` 或会话 `running: false` 后停止。计时文本、单位和动画由移动端本地化渲染。
+
+重连得到的 `session-snapshot.events` 只含最近窗口，长时间运行的 Turn 可能已把 `turn/start` 挤出窗口。此时 `sessions.items[].running` 仍可用来显示“深度求索中”，但不能只凭快照推断准确的起始时间；若需要恢复精确计时，应沿 `nextBeforeSeq` 读取更早历史，找到最近尚未结束的 `turn/start`。未取得起始时间前不要从重连时刻重新计算并声称是整轮耗时。
+
 ---
 
 ## 14. 端到端示例（Postman）
@@ -1157,7 +1186,7 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 3. `{"type":"subscribe","sessionId":"session-abc","assistantStream":true}`，等待 `session-snapshot`
 4. `{"type":"message","sessionId":"session-abc","text":"帮我查一下deepseek"}` → `sent`
 5. 盯着 Messages 面板：独立 `assistant-stream` 展示 token，`event` 流提供已提交的消息和工具事件
-6. `{"type":"history","sessionId":"session-abc","view":"conversation","maxMessages":60}` → 最近历史（自动分页用 `beforeSeq: nextBeforeSeq, historyFormatVersion: 3`）
+6. `{"type":"history","sessionId":"session-abc","view":"conversation","maxMessages":60}` → 最近历史（自动分页用 `beforeSeq: nextBeforeSeq, historyFormatVersion: 4`）
 7. `{"type":"session-stats","sessionId":"session-abc"}` → 统计条数据
 8. 完事 `{"type":"unsubscribe"}` 或 Disconnect
 
@@ -1186,6 +1215,7 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 | v0.8.0 | 会话工作区文件上传：`file-upload-open` / `file-upload-write` / `file-upload-cancel` 三帧与 `file-upload-opened` / `file-upload-ack` / `file-upload-committed` / `file-upload-cancelled` 四种 kind；分块 ack、声明大小与 SHA-256 校验、同目录临时文件 + fsync + 原子 rename 落盘、失败与中断清理；新增 `fileUploadsEnabled` / `fileUploadMaxBytes` / `fileUploadChunkMaxBytes` / `fileUploadMaxTransfers` / `fileUploadAllowOverwrite` / `fileUploadAllowCreateDirectories` 配置与 `file-uploads` 能力 |
 | v0.8.1–0.8.2 | 修 harness 0.1.6-alpha.2 起 `session/control` 基线不再携带 `queues` 字段的兼容问题：此前每次连接都会抛错并导致整条 control 流每秒重建（projections 永远挂不上）。现在缺失/null 时按空队列处理并记日志（`session queue baseline absent …`），不再中断流；同时修掉首版补丁在 `sessionQueues` 仍为 null 时的崩溃 |
 | v0.9.0 | 上传到临时目录：`file-upload-open` 新增 `root: "workspace" \| "temp"`（缺省 `workspace`，向后兼容）；`"temp"` 时落 `<fileUploadTempDirectory>/<UTC 日期>/<文件名>`（`path` 仅接受纯文件名），`file-upload-opened` / `file-upload-committed` 新增 `absolutePath` 字段；新增 `fileUploadTempDirectory`（默认 `/root/dsh-uploads`）与 `fileUploadTempRetentionDays`（默认 7，0 = 关闭清理）配置，插件启动时与每小时按 mtime 清理过期文件与空目录（含遗留 24 小时以上的 `.part`） |
+| v0.9.0（当前源码） | DSH 0.2.0-rc.2 插件管理；PC 端 Cloudflare Quick / 命名 Tunnel 及独立重启；插件私有 `cloudflared` 缓存及校验；配对入口选择指引；网关重启与 DSH Web 停止工具 |
 | v0.7.2 | 独立对话/控制连接；空 Session 创建；停止生成与稍后继续；排队消息同步及编辑/删除/Steer；App 归档/重命名 Session；WebUI 归档集合和名称变化实时同步到 App |
 | v0.1.5 | workspace-create / directories / host |
 | v0.1.6 | 修复消息分发器遗漏（host/directories/workspace-create 未路由） |
@@ -1211,6 +1241,46 @@ Control/旧单连接接收全局模式状态增量，不受所订阅会话过滤
 | v0.6.9 | 服务端驱动的命令与技能目录：支持本地化 Hint、通用二级选项、专用命令执行，以及 command/compaction 生命周期事件；Host 命令不再作为用户 Prompt 发送 |
 | v0.7.0 | 任务与 Goal 对齐：任务/Goal 基线查询、`todos`/`goal` 实时投影、Goal 改名、暂停、继续与删除 |
 | v0.7.1 | DSH v0.1.2-rc.1 兼容：内部迁移至 Remote Gateway 与 Host waterfall，移除 APIProxy 依赖；`dsh-mobile-v1` 保持不变 |
+
+---
+
+## 17. 定时任务（DSH 0.1.7-rc.2）
+
+以下请求走控制连接，网关映射到 Host `schedule` Remote namespace。Host 未启用定时任务时返回统一的 `kind: error`，`requestType` 保留原请求类型。定时任务与第 6 节的 Session `todos` 是不同的数据源。
+
+| 请求 type | 参数 | 成功响应 |
+|---|---|---|
+| `schedule-catalog` | — | `kind: schedule-catalog`, `items`: 全宿主活动与已结束提醒，包含原 `sessionId`、`status` 和可选最近投递回执 |
+| `schedule-list` | `sessionId` | `kind: schedule-list`, `sessionId`, `items`: 当前会话活动提醒 |
+| `schedule-history` | `sessionId`, `id`, `limit` 1–100, `before?` | `kind: schedule-history`, `records`（从新到旧）、`retention`、`nextBefore?`；任务或游标未找到时在成功帧中返回 `code` |
+| `schedule-update` | `sessionId`, `id`, 完整的 `expected`, `title?`, `prompt?`, `change?`, `requestId?` | `kind: schedule-update`, `updated`, `record`；并发冲突、已结束或未找到时返回 `updated:false` 与 `code` |
+| `schedule-delete` | `sessionId`, `id`, `requestId?` | `kind: schedule-delete`, `deleted`；未找到时返回 `deleted:false` 与 `code` |
+
+`expected` 必须是编辑前从 `schedule-list` 或 `schedule-catalog` 取得的完整任务记录，`id` 必须匹配；不要只传 id 或重建部分字段。网关会去掉目录行额外的 `sessionId`、`status`、`lastDelivery` 元数据后调用 Host。`change` 使用 Host 的 `at`、`every`、`daily`、`weekly`、`cron` 判别结构。更新与删除只对原会话绑定生效；`requestId` 若提供会原样回显。删除会同时移除该任务的投递记录，不撤回已入队的消息。
+
+rc.2 没有 `schedule/create` Remote 方法。新提醒由 Agent 的 `schedule_create` 工具创建；到期提醒作为 `source.kind: schedule` 的消息进入原 Session。Host 的无载荷 `schedule/changed` 被投影为移动端 `schedule-changed`；实现定时任务管理页面的客户端应在收到通知、重连或完成更新/删除后重新查询目录。当前移动端只接入协议请求、解码与变更帧识别，尚未提供管理页面。`hello.capabilities` 中的 `schedule-management` 表示网关支持这些请求，实际使用仍取决于 Host 是否启用定时任务。
+
+## 18. 插件管理（DSH 0.2.0-rc.2）
+
+`hello.capabilities` 包含 `plugin-management-v1`。插件请求走控制连接，必须使用已配对设备 token；即使本机调试关闭了普通连接鉴权，匿名连接也不能执行这些请求。每个请求必须有非空 `requestId`，响应回显。`plugin-catalog` 的 `managementAvailable` 决定当前 Host profile 是否实际支持管理。
+
+| 请求 type | 主要参数 | 成功响应 |
+|---|---|---|
+| `plugin-catalog` | `requestId` | 同名 kind；`managementAvailable`、`bundles`（每项含 `experimental`）、`plugins`、`officialItems`、`settingsWritable` |
+| `plugin-registries` | `requestId` | 同名 kind；`registry`、`fallbackRegistries`、`resolved` |
+| `plugin-inspect` | `requestId`, `spec`, `registry?` | `plugin-inspection`；`result` 为 accepted/refused 检查结果 |
+| `plugin-install` | `requestId`, `spec`, `enabled?`, `registry?`, `approvedBuilds?` | `plugin-install-result`；`result` 为 Host `ChangeResult` |
+| `plugin-install-status` / `plugin-install-cancel` | `requestId`, `installId` | 同名 kind；`result` 为安装结果/null 或取消状态 |
+| `plugin-bundle-set-enabled` | `requestId`, `name`, `enabled` | 同名 kind；`result` 为 `ChangeResult` |
+| `plugin-entry-set-enabled` | `requestId`, `entryId`, `enabled` | 同名 kind；`result` 为 `ChangeResult` |
+| `plugin-remove` | `requestId`, `name` | 同名 kind；`result` 为 `ChangeResult` |
+| `plugin-settings` | `requestId`, `ns?` | 同名 kind；全部 namespace 或指定的 `namespace` 视图 |
+| `plugin-settings-mutate` | `requestId`, `ns`, `expectedRevision`, `ops` | 同名 kind；返回修改后的 namespace 视图 |
+| `plugin-version-exemptions` / `plugin-version-exemption-set` | `requestId`；写入还需 `packageVersion`, `runtimeVersion`, `enabled`, `acceptRisk?` | 同名 kind；豁免列表或 `ChangeResult` |
+
+Host 的 `plugin-manager/changed` 转为 `plugins-changed`（含 `reason`），`settings/document-updated` 转为 `plugin-settings-changed`（含 `ns`、`revision`）。`plugin-manager/install-state` 和 `plugin-manager/install-log` 只发给发起安装的连接，分别转为 `plugin-install-state` 和 `plugin-install-log`；它们的 `requestId` 就是原安装请求 ID。断线后用新的请求 ID 调 `plugin-install-status`，`installId` 填原安装 ID；切勿直接重复安装。关闭/卸载网关插件自身可能先断线，再由 DSH Web/CLI 恢复。
+
+详细字段、官方/第三方页面分组、安装进度、配置 schema、错误处理和 DSH Mobile 验收步骤见 [插件管理对接方案](docs/dsh-0.2.0-rc.2-plugin-management-mobile-integration.md)。
 
 ---
 
